@@ -31,7 +31,7 @@ if not api_key:
 print(f"OK: API key loaded from CredMan (length={len(api_key)})")
 
 # Get base URL — same fallback as bot config
-base_url = os.environ.get("OPENAI_BASE_URL", "https://api.minimax.chat/v1")
+base_url = os.environ.get("OPENAI_BASE_URL", "https://api.minimax.io/anthropic")
 
 # OpenAI client (MiniMax is OpenAI-compatible)
 try:
@@ -98,7 +98,7 @@ def review_pr(repo, pr_number):
 
     try:
         resp = client.chat.completions.create(
-            model="MiniMax-M3",
+            model="MiniMax-M3[1m]",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": f"Review this PR diff:\n\n```\n{diff[:8000]}\n```"},
