@@ -45,6 +45,17 @@ else
 fi
 echo
 
+# LLM review posting test (TDD for T35)
+echo "── LLM review GitHub posting tests ──"
+if PYTHONPATH=. python -m unittest tests.test_llm_review_post -v 2>&1 > /dev/null; then
+    PASS=$((PASS + 1))
+    echo "PASS"
+else
+    FAIL=$((FAIL + 1))
+    FAILED_TESTS+=("tests/test_llm_review_post.py")
+fi
+echo
+
 echo "════════════════════════════════"
 echo "Passed: $PASS"
 echo "Failed: $FAIL"

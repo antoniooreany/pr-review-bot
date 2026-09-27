@@ -6,14 +6,10 @@ import sys
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-# Resolve single PR from args
-if len(sys.argv) != 3:
-    print("Usage: python llm_review_one.py <repo> <pr_number>")
-    print("Example: python llm_review_one.py winwin-backend-test-task 48")
-    sys.exit(1)
-
-REPO = sys.argv[1]
-PR_NUMBER = int(sys.argv[2])
+# REPO and PR_NUMBER are set by main() at runtime (not at import —
+# otherwise the module-level `int(sys.argv[2])` breaks test discovery).
+REPO = ""
+PR_NUMBER = 0
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "slack-notifier"))
 # Prefer env OPENAI_API_KEY (real OpenAI key in Anton's env), fall back to CredMan
@@ -141,7 +137,37 @@ def main():
         print(f"Tokens used: {resp.usage.total_tokens} (model: {resp.model})")
     except Exception as e:
         print(f"ERROR: {e}")
+        return
+
+    # Post to GitHub PR as a comment so it shows in the web UI.
+    post_to_pr(content)
+
+
+def post_to_pr(review_text):
+    """Post review as a PR comment via gh CLI."""
+    body = (
+        "🤖 **PR-Agent review (via LLM)**\n\n"
+        f"{review_text}\n\n"
+        "<sub>Posted by [pr-review-bot](https://github.com/pr-review-bot/pr-review-bot)</sub>\n"
+    )
+    result = subprocess.run(
+        ["gh", "pr", "comment", str(PR_NUMBER),
+         "--repo", f"antoniooreany/{REPO}",
+         "--body", body],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"\n✅ Posted review as PR comment to {REPO}#{PR_NUMBER}")
+        print(f"   View at: https://github.com/antoniooreany/{REPO}/pull/{PR_NUMBER}")
+    else:
+        print(f"\n⚠️ Failed to post comment: {result.stderr}")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print("Usage: python llm_review_one.py <repo> <pr_number>")
+        print("Example: python llm_review_one.py winwin-backend-test-task 48")
+        sys.exit(1)
+    REPO = sys.argv[1]
+    PR_NUMBER = int(sys.argv[2])
     main()
