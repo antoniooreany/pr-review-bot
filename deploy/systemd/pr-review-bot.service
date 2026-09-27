@@ -1,0 +1,39 @@
+[Unit]
+Description=pr-review-bot (PR-Agent + MiniMax-M3 sidecar)
+Documentation=https://github.com/pr-review-bot/pr-review-bot
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/pr-review-bot
+ExecStartPre=-/usr/bin/docker compose pull
+ExecStart=/usr/bin/docker compose up -d --remove-orphans
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose up -d --force-recreate
+
+# Restart on failure (not on clean stop)
+Restart=on-failure
+RestartSec=30
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/pr-review-bot /var/log/pr-review-bot
+PrivateTmp=yes
+
+# Environment — secrets should be in /etc/pr-review-bot/secrets.env (mode 0600)
+EnvironmentFile=-/etc/pr-review-bot/secrets.env
+
+# Logging to journald (visible via journalctl -u pr-review-bot)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pr-review-bot
+
+[Install]
+WantedBy=multi-user.target
