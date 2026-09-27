@@ -1,0 +1,51 @@
+# pr-review-bot — single-host deployment of PR-Agent in webhook mode.
+# Docs: https://docs.pr-agent.ai/installation/gitlab/
+
+services:
+  pr-agent:
+    image: pragent/pr-agent:latest
+    container_name: pr-review-bot
+    restart: unless-stopped
+
+    # Secrets come from .env (gitignored). Defaults from .env.example
+    # won't work — you must cp .env.example .env and fill it in.
+    env_file:
+      - .env
+
+    environment:
+      # PR-Agent reads the config file path from PR_AGENT_CONFIG.
+      - PR_AGENT_CONFIG=${PR_AGENT_CONFIG:-/app/configuration.toml}
+      # Webhook port (used by the healthcheck + container networking).
+      - PR_AGENT_PORT=${PR_AGENT_PORT:-3000}
+
+    volumes:
+      # Read-only mount of the behavior config.
+      - ./configuration.toml:/app/configuration.toml:ro
+      # Optional hotels-data conventions consumed on /review.
+      - ./review_guidelines.md:/app/review_guidelines.md:ro
+      # Persist PR-Agent's local state (logs, cache) across container restarts.
+      - pr-agent-data:/app/data
+
+    ports:
+      # Bind only to loopback — GitLab reaches this via reverse proxy
+      # (or directly if on the same host). Do NOT expose 0.0.0.0.
+      - "127.0.0.1:${PR_AGENT_PORT:-3000}:3000"
+
+    healthcheck:
+      # PR-Agent exposes /health in webhook mode. If the upstream image
+      # uses a different path, adjust this line.
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pr-agent-data:
+    name: pr-review-bot-data
