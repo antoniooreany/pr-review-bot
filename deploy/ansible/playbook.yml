@@ -1,0 +1,99 @@
+---
+# pr-review-bot deploy playbook.
+# Idempotent — safe to re-run. Single-host (no inventory required).
+#
+# Usage:
+#   ansible-playbook -i localhost, -c local deploy/ansible/playbook.yml \
+#     --extra-vars "bot_user=prreview bot_home=/opt/pr-review-bot"
+#
+# Variables (override via --extra-vars or inventory):
+#   bot_user       — system user that owns the bot dir (default: prreview)
+#   bot_home       — install location (default: /opt/pr-review-bot)
+#   bot_repo_url   — git remote to clone from (default: https://github.com/pr-review-bot/pr-review-bot.git)
+#   bot_version    — git ref to check out (default: v1.4.0)
+
+- name: pr-review-bot deploy
+  hosts: localhost
+  connection: local
+  become: true
+  vars:
+    bot_user: prreview
+    bot_home: /opt/pr-review-bot
+    bot_repo_url: https://github.com/pr-review-bot/pr-review-bot.git
+    bot_version: v1.4.0
+  tasks:
+    - name: Ensure bot user exists
+      ansible.builtin.user:
+        name: "{{ bot_user }}"
+        system: yes
+        shell: /usr/sbin/nologin
+        home: "{{ bot_home }}"
+        create_home: yes
+
+    - name: Install system dependencies
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - python3
+        state: present
+        update_cache: yes
+
+    - name: Ensure bot directory exists
+      ansible.builtin.file:
+        path: "{{ bot_home }}"
+        state: directory
+        owner: "{{ bot_user }}"
+        group: "{{ bot_user }}"
+        mode: "0750"
+
+    - name: Clone or update bot repo
+      ansible.builtin.git:
+        repo: "{{ bot_repo_url }}"
+        dest: "{{ bot_home }}"
+        version: "{{ bot_version }}"
+        force: no
+      become_user: "{{ bot_user }}"
+
+    - name: Copy systemd unit file
+      ansible.builtin.copy:
+        src: "{{ bot_home }}/deploy/systemd/pr-review-bot.service"
+        dest: "/etc/systemd/system/pr-review-bot.service"
+        owner: root
+        group: root
+        mode: "0644"
+        remote_src: yes
+      notify: reload systemd
+
+    - name: Ensure secrets directory exists
+      ansible.builtin.file:
+        path: /etc/pr-review-bot
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Warn if secrets.env missing
+      ansible.builtin.debug:
+        msg: |
+          Create /etc/pr-review-bot/secrets.env with mode 0600 containing:
+            OPENAI_KEY=<your-minimax-key>
+            SLACK_WEBHOOK_URL=<your-slack-webhook>
+            GITLAB_TOKEN=<your-gitlab-pat>
+            WEBHOOK_SECRET=<random-32-bytes-hex>
+            GITHUB_BOT_TOKEN=<optional>
+            JIRA_URL=<optional> ...
+          Bot won't start without these. See deploy/README.md.
+      when: not ansible_check_mode
+
+    - name: Enable and start bot service
+      ansible.builtin.systemd:
+        name: pr-review-bot
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+  handlers:
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
