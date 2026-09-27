@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Structured logging — one JSON line per event. Consumed by Promtail/Loki in
@@ -33,6 +34,78 @@ log = logging.getLogger("slack-notifier")
 # ---------------------------------------------------------------------------
 # Pure functions — easy to unit-test, no I/O.
 # ---------------------------------------------------------------------------
+
+def _probe_url(url, method="GET", headers=None, timeout=5):
+    """Single HTTP probe. Returns dict with status, http_code (optional),
+    latency_ms, and error (optional). Never raises."""
+    start = time.monotonic()
+    req = urllib.request.Request(url, method=method)
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1)  # drain at least one byte
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "status": "ok" if 200 <= resp.status < 300 else "fail",
+                "http_code": resp.status,
+                "latency_ms": elapsed_ms,
+            }
+    except urllib.error.HTTPError as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return {
+            "status": "fail",
+            "http_code": e.code,
+            "latency_ms": elapsed_ms,
+            "error": f"http_{e.code}",
+        }
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        return {
+            "status": "fail",
+            "latency_ms": elapsed_ms,
+            "error": str(e)[:100],
+        }
+
+
+def check_gitlab(gitlab_url, timeout=3):
+    """Ping GitLab /api/v4/version. Returns probe result dict."""
+    return _probe_url(gitlab_url, method="GET", timeout=timeout)
+
+
+def check_llm(llm_url, api_key, timeout=5):
+    """Ping LLM /v1/models with auth. Returns probe result dict."""
+    return _probe_url(
+        llm_url,
+        method="GET",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=timeout,
+    )
+
+
+def run_health_checks(gitlab_url, llm_url, llm_api_key,
+                      gitlab_timeout=3, llm_timeout=5):
+    """Run GitLab and LLM probes in parallel. Returns aggregate health.
+
+    Total wall time = max(gitlab_timeout, llm_timeout) + overhead.
+    """
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gitlab_future = executor.submit(check_gitlab, gitlab_url, gitlab_timeout)
+        llm_future = executor.submit(check_llm, llm_url, llm_api_key, llm_timeout)
+        gitlab_result = gitlab_future.result()
+        llm_result = llm_future.result()
+
+    aggregate = "healthy" if (gitlab_result["status"] == "ok" and
+                              llm_result["status"] == "ok") else "unhealthy"
+    return {
+        "status": aggregate,
+        "checks": {
+            "gitlab": gitlab_result,
+            "llm": llm_result,
+        },
+    }
+
 
 def verify_signature(headers, expected_token):
     """Validate X-Gitlab-Token header against expected_token.
@@ -254,6 +327,28 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
+            return
+        # Deep health: probe upstream dependencies in parallel.
+        if self.path == "/health/deep":
+            gitlab_url = os.environ.get("GITLAB_URL", "")
+            llm_url = os.environ.get("OPENAI_BASE_URL", "")
+            llm_key = os.environ.get("OPENAI_KEY", "")
+            if not gitlab_url or not llm_url:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"unconfigured"}')
+                return
+            result = run_health_checks(
+                gitlab_url=f"{gitlab_url.rstrip('/')}/api/v4/version",
+                llm_url=f"{llm_url.rstrip('/')}/v1/models",
+                llm_api_key=llm_key,
+            )
+            code = 200 if result["status"] == "healthy" else 503
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode("utf-8"))
             return
         self.send_response(404)
         self.end_headers()
