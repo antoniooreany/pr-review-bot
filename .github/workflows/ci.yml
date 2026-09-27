@@ -25,3 +25,25 @@ jobs:
 
       - name: Validate GitLab CI template
         run: bash tests/test_template_validity.sh
+
+      - name: Validate deploy automation files
+        run: bash tests/test_deploy_files.sh
+
+  # T25 self-test: integration test with mock Slack/GitLab/Jira.
+  # Runs the real slack-notifier binary as a server and verifies end-to-end flow.
+  e2e-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run e2e smoke test
+        working-directory: slack-notifier
+        run: |
+          PYTHONPATH=. python ../smoke/e2e_smoke.py
+        env:
+          PYTHONUNBUFFERED: "1"

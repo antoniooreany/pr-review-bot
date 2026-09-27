@@ -148,17 +148,78 @@ Devs can opt-out per-MR by adding a `do-not-review` label.
 ## CI/CD
 
 This project's own CI runs on **GitHub Actions** (`.github/workflows/ci.yml`):
-runs the test suite on every push and PR to `main` / `develop`.
+
+| Job | Purpose |
+|---|---|
+| `test` | Runs `tests/run_all.sh` + validates deploy files + template |
+| `e2e-smoke` (T25) | Runs `smoke/e2e_smoke.py` — real HTTP flow with mock Slack/GitLab/Jira |
+
+Both jobs run on `ubuntu-latest` with Python 3.12, on every push to
+`main`/`develop` and on every PR.
 
 CI/CD for **target repos** (hotels-data and friends) is **not** in scope.
 Mode A doesn't touch their CI/CD at all; Mode B requires the repo owner
 to add a single `include:` line. See [docs/deployment-modes.md](docs/deployment-modes.md).
 
+## Storing MiniMax API key (T29 + T34)
+
+The bot reads API keys via `get_secret()` with resolution order:
+1. Environment variable (e.g., `OPENAI_KEY`)
+2. Windows Credential Manager target `pr-review-bot:OPENAI_KEY`
+3. `fallback` parameter (default `None`)
+
+### Setup on Windows (recommended)
+
+Use the helper script — key is read hidden, stored OS-encrypted:
+
+```powershell
+PS> .\scripts\setup_credentials.ps1
+==> Enter MiniMax API key (hidden): ********
+==> Storing in Windows Credential Manager...
+==> OK: pr-review-bot:OPENAI_KEY is stored
+==> Testing retrieval via PowerShell (same path the bot uses)...
+==> OK: bot can retrieve key (length=64)
+==> Setup complete.
+```
+
+The script uses `Read-Host -AsSecureString` (no screen echo), stores via
+`cmdkey /generic:`, verifies with `cmdkey /list`, and tests retrieval
+via `Get-StoredCredential` — the exact same PowerShell call the bot uses.
+
+### Verify
+
+```powershell
+PS> .\scripts\test_credman.ps1
+PASS: credential readable, key length=64 chars
+```
+
+### Rotate / remove
+
+```powershell
+# Rotate (run setup again with new key)
+PS> .\scripts\setup_credentials.ps1
+
+# Remove entirely
+PS> cmdkey /delete:pr-review-bot:OPENAI_KEY
+```
+
+### On Linux (or no CredMan available)
+
+Use `.env` (gitignored) — same env vars, no CredMan:
+
+```bash
+cat >> .env <<EOF
+OPENAI_KEY=your-key-here
+OPENAI_BASE_URL=https://api.minimax.io/v1
+EOF
+```
+
 ## Rotate secrets
 
 | Secret | How to rotate |
 |---|---|
-| `OPENAI_KEY` | Generate new in MiniMax console, update `.env`, `docker compose up -d` |
+| `OPENAI_KEY` (CredMan) | Run `setup_credentials.ps1` with new key |
+| `OPENAI_KEY` (.env) | Update `.env`, restart container |
 | `GITLAB_TOKEN` | Rotate PAT in GitLab UI, update `.env`, `docker compose up -d` |
 | `WEBHOOK_SECRET` | Generate new (`openssl rand -hex 32`), update `.env` AND the GitLab webhook settings (both sides must match) |
 
