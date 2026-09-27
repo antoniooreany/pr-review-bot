@@ -1,5 +1,1 @@
-Name                         Stmts   Miss  Cover
-------------------------------------------------
-slack-notifier\notifier.py     442    442     0%
-------------------------------------------------
-TOTAL                          442    442     0%
+No source for code: 'C:\Users\anton\Projects\pr-review-bot\smoke\e2e_smoke.py'; see https://coverage.readthedocs.io/en/7.14.1/messages.html#error-no-source

@@ -306,8 +306,21 @@ def _labels_key(labels):
 def _format_labels(labels_tuple):
     if not labels_tuple:
         return ""
-    parts = [f'{k}="{v}"' for k, v in labels_tuple]
+    parts = [f'{k}="{_escape_label_value(v)}"' for k, v in labels_tuple]
     return "{" + ",".join(parts) + "}"
+
+
+def _escape_label_value(value):
+    """Escape a Prometheus label value per exposition format.
+
+    See https://prometheus.io/docs/instrumenting/exposition_formats/
+    Backslash, double-quote, and newline must be escaped.
+    """
+    s = str(value)
+    s = s.replace("\\", "\\\\")    # backslash first
+    s = s.replace('"', '\\"')      # double quote
+    s = s.replace("\n", "\\n")     # newline
+    return s
 
 
 def metrics_render():
