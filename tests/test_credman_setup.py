@@ -54,6 +54,23 @@ class CredentialScriptsExistTests(unittest.TestCase):
             content = f.read()
         self.assertIn("Get-StoredCredential", content)
 
+    def test_setup_uses_pass_not_user(self):
+        """Must use /pass: (password field), not /user: (username field).
+
+        Bot reads via GetNetworkCredential().Password — that's the password
+        field. Storing in /user: puts the key in username field, bot reads empty.
+        """
+        path = os.path.join(REPO, "scripts", "setup_credentials.ps1")
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("/pass:", content)
+        # /user: only OK as a non-secret username like "MiniMax"
+        import re
+        # Find the cmdkey call line — ensure /pass: present and /user:NOT being used for the secret
+        for line in content.split("\n"):
+            if "cmdkey" in line and "pr-review-bot" in line:
+                self.assertIn("/pass:", line, f"cmdkey line missing /pass: → {line!r}")
+
     def test_test_script_uses_correct_target(self):
         path = os.path.join(REPO, "scripts", "test_credman.ps1")
         with open(path, encoding="utf-8") as f:

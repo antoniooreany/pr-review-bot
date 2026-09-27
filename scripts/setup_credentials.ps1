@@ -72,7 +72,11 @@ if ([string]::IsNullOrWhiteSpace($plainKey)) {
 
 Write-Step "Storing in Windows Credential Manager..."
 $target = "pr-review-bot:OPENAI_KEY"
-cmdkey /generic:$target /user:$plainKey
+# IMPORTANT: use /pass: (not /user:). The bot reads via
+# Get-StoredCredential().GetNetworkCredential().Password, which returns
+# the PASSWORD field. Storing in /user: puts the key in the username
+# field — bot would read empty string.
+cmdkey /generic:$target /user:MiniMax /pass:$plainKey
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: cmdkey failed with exit code $LASTEXITCODE" -ForegroundColor Red
     exit 1
