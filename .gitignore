@@ -1,0 +1,34 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# Secrets — never commit real keys
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Runtime / build artifacts
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local AI tooling memory (SDD/Speckit artifacts)
+.specify/
+
+# Docker volume mounts (when bind-mounted into repo)
+docker-data/
+pr-agent-data/
+
+# Test artifacts
+coverage/
+.coverage
+.pytest_cache/
