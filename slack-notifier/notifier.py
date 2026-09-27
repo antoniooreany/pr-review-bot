@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -38,11 +39,224 @@ log = logging.getLogger("slack-notifier")
 # Pure functions — easy to unit-test, no I/O.
 # ---------------------------------------------------------------------------
 
+# ── T26: admin commands via MR/PR comments ────────────────────────────────────
+
+_bot_state = {
+    "enabled": True,
+    "disabled_at": None,
+    "disabled_by": None,
+    "admin_user_id": "",  # set via env var BOT_ADMIN_USER_ID
+}
+
+
+def handle_admin_command(command, admin_user_id, slack_webhook_url=""):
+    """Process a /bot <verb> slash command from an MR/PR comment.
+
+    Allowed commands:
+      /bot status   — post Slack with health snapshot
+      /bot disable  — turn off Slack notifications (bot reviews still post)
+      /bot enable   — re-enable
+      /bot stats    — post Slack with metrics summary
+
+    Authorization: only the configured admin_user_id can run.
+    Non-admin attempts return False silently (no Slack reply).
+    Returns True if processed, False if rejected.
+    """
+    # Auth check FIRST — don't mutate state before validating caller.
+    caller = str(admin_user_id) if admin_user_id else ""
+    expected = _bot_state.get("admin_user_id", "")
+    if caller != expected or not caller:
+        log.info(f"admin_unauthorized caller={caller}")
+        return False
+
+    # Now seed admin_user_id from env if not yet set (first admin call)
+    if not _bot_state["admin_user_id"] and caller:
+        _bot_state["admin_user_id"] = caller
+
+    if not command or not command.startswith("/bot "):
+        return False
+
+    verb = command[5:].strip().lower()
+    if verb not in ("status", "disable", "enable", "stats"):
+        log.info(f"admin_unknown_verb verb={verb}")
+        return False
+
+    log.info(f"admin_command verb={verb}")
+
+    # Execute verb. Return True if processed (regardless of Slack post result).
+    if verb == "status":
+        summary = f"enabled={_bot_state['enabled']}  disabled_at={_bot_state['disabled_at']}"
+        post_to_slack(
+            url=slack_webhook_url,
+            mr_url="admin://status",
+            mr_title="Bot status",
+            author="admin",
+            severity="ℹ️ INFO",
+            summary=summary,
+            request_id="admin-status",
+        )
+        return True
+
+    if verb == "stats":
+        post_to_slack(
+            url=slack_webhook_url,
+            mr_url="admin://stats",
+            mr_title="Bot stats",
+            author="admin",
+            severity="ℹ️ INFO",
+            summary=metrics_render()[:500],
+            request_id="admin-stats",
+        )
+        return True
+
+    if verb == "disable":
+        _bot_state["enabled"] = False
+        _bot_state["disabled_at"] = time.time()
+        _bot_state["disabled_by"] = caller
+        log.info(f"admin_disabled by={caller}")
+        post_to_slack(
+            url=slack_webhook_url,
+            mr_url="admin://disable",
+            mr_title="Bot disabled",
+            author="admin",
+            severity="ℹ️ INFO",
+            summary=f"Slack notifications OFF. Re-enable with `/bot enable`. Disabled by user_id={caller}.",
+            request_id="admin-disable",
+        )
+        return True
+
+    if verb == "enable":
+        was_disabled_by = _bot_state["disabled_by"]
+        _bot_state["enabled"] = True
+        _bot_state["disabled_at"] = None
+        _bot_state["disabled_by"] = None
+        log.info(f"admin_enabled by={caller}")
+        post_to_slack(
+            url=slack_webhook_url,
+            mr_url="admin://enable",
+            mr_title="Bot re-enabled",
+            author="admin",
+            severity="ℹ️ INFO",
+            summary=f"Slack notifications ON. Was disabled by user_id={was_disabled_by}.",
+            request_id="admin-enable",
+        )
+        return True
+
+    return False  # unreachable
+
+
 # ── T24: request_id generation (12 hex chars) ────────────────────────────────
 
 def generate_request_id():
     """Generate a 12-char hex request_id for log correlation."""
     return uuid.uuid4().hex[:12]
+
+
+# ── T26: admin state (module-level singleton) ────────────────────────────────
+
+_bot_state = {
+    "enabled": True,
+    "disabled_at": None,
+    "disabled_by": None,
+    "admin_user_id": "",  # set via env var BOT_ADMIN_USER_ID
+}
+
+
+# ── T29: secrets resolution (env -> Windows Credential Manager -> fallback) ─
+
+def get_secret(key, credman_target="pr-review-bot", fallback=None):
+    """Resolve a secret by checking env var first, then Windows Credential Manager.
+
+    Resolution order:
+      1. Environment variable `key` — wins if set (even to empty string).
+      2. Windows Credential Manager: Generic credential with target
+         `<credman_target>:<KEY>` — read via PowerShell.
+      3. `fallback` — used if both missing.
+
+    Operators store creds once with `cmdkey /generic:pr-review-bot:<KEY>`:
+      cmdkey /generic:pr-review-bot:OPENAI_KEY /user:apikey
+    The /user value is the password (your secret). Read back via PowerShell.
+    """
+    val = os.environ.get(key)
+    if val:
+        return val
+    try:
+        cred_val = _read_windows_credman(credman_target, key)
+    except (OSError, RuntimeError) as e:
+        log.debug(f"get_secret_credman_failed key={key} err={e}")
+        cred_val = None
+    if cred_val:
+        return cred_val
+    return fallback
+
+
+def _read_windows_credman(credman_target, key):
+    """Read a generic credential from Windows Credential Manager via PowerShell.
+
+    Returns the password string, or None if not found / unsupported platform.
+    Never raises — all errors map to None (graceful degradation).
+    """
+    if sys.platform != "win32":
+        return None
+    target = f"{credman_target}:{key}"
+    ps_cmd = (
+        f"$ErrorActionPreference = 'SilentlyContinue'; "
+        f"$c = Get-StoredCredential -Target '{target}'; "
+        f"if ($c) {{ $c.GetNetworkCredential().Password }} "
+        f"else {{ '' }}"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        log.debug(f"credman_read_failed target={target} err={e}")
+        return None
+    if result.returncode != 0:
+        log.debug(f"credman_nonzero_exit target={target} stderr={result.stderr[:100]}")
+        return None
+    val = result.stdout.strip()
+    return val if val else None
+
+
+def _extract_comment(payload, provider):
+    """Extract comment body, provider-agnostic."""
+    if provider == "gitlab":
+        return (payload.get("object_attributes") or {}).get("note", "")
+    if provider == "github":
+        return (payload.get("comment") or {}).get("body", "")
+    return ""
+
+
+def _extract_pr_url(payload, provider):
+    """Extract MR/PR URL, provider-agnostic."""
+    if provider == "gitlab":
+        return (payload.get("merge_request") or {}).get("url", "")
+    if provider == "github":
+        return (payload.get("issue") or {}).get("html_url", "")
+    return ""
+
+
+def _extract_mr_title(payload, provider):
+    """Extract MR/PR title, provider-agnostic."""
+    if provider == "gitlab":
+        return (payload.get("merge_request") or {}).get("title", "")
+    if provider == "github":
+        return (payload.get("issue") or {}).get("title", "")
+    return ""
+
+
+def _extract_author_id(payload, provider):
+    """Extract comment author identifier, provider-agnostic.
+
+    GitLab: numeric user.id. GitHub: string sender.login.
+    """
+    if provider == "gitlab":
+        return (payload.get("user") or {}).get("id")
+    if provider == "github":
+        return (payload.get("sender") or {}).get("login")
+    return None
 
 
 # ── T21: metrics counters (Prometheus exposition format, in-memory) ──────────
@@ -258,11 +472,86 @@ def verify_signature(headers, expected_token):
 
 
 def is_bot_comment(payload, bot_user_id):
-    """True if the GitLab note event was authored by our bot user."""
+    """True if the comment event was authored by our bot user.
+
+    Provider-agnostic via T30. Falls back to GitLab format (user.id) when
+    provider can't be detected — keeps legacy callers working.
+    """
     if not bot_user_id:
         return False
-    user = payload.get("user") or {}
-    return user.get("id") == bot_user_id
+    provider = _detect_provider(payload, {})
+    if not provider:
+        # Fallback for unknown payload — assume GitLab shape (legacy behavior).
+        return (payload.get("user") or {}).get("id") == bot_user_id
+    return _extract_author_id(payload, provider) == bot_user_id
+
+
+# ── T30: provider abstraction (GitLab + GitHub) ───────────────────────────────
+
+def _detect_provider(payload, headers):
+    """Auto-detect GitLab vs GitHub webhook payload.
+
+    Detection priority:
+      1. Headers (most reliable — set by webhook sender).
+      2. Payload structure (fallback for callers who don't pass headers).
+
+    GitLab: object_kind == "note" on a MergeRequest.
+    GitHub: X-GitHub-Event == "issue_comment" with action == "created",
+            OR payload has {action: "created", comment, issue.html_url}.
+    Returns: "gitlab" | "github" | None
+    """
+    if payload.get("object_kind") == "note":
+        return "gitlab"
+    event = (headers.get("X-Github-Event") or headers.get("X-GitHub-Event") or "").lower()
+    if event == "issue_comment" and payload.get("action") == "created":
+        return "github"
+    # Structural fallback when headers aren't passed (e.g. unit tests, retries)
+    if (payload.get("action") == "created"
+            and "comment" in payload
+            and "issue" in payload
+            and "html_url" in payload.get("issue", {})):
+        return "github"
+    return None
+
+
+def _extract_comment(payload, provider):
+    """Extract comment body, provider-agnostic."""
+    if provider == "gitlab":
+        return (payload.get("object_attributes") or {}).get("note", "")
+    if provider == "github":
+        return (payload.get("comment") or {}).get("body", "")
+    return ""
+
+
+def _extract_pr_url(payload, provider):
+    """Extract MR/PR URL, provider-agnostic."""
+    if provider == "gitlab":
+        return (payload.get("merge_request") or {}).get("url", "")
+    if provider == "github":
+        return (payload.get("issue") or {}).get("html_url", "")
+    return ""
+
+
+def _extract_mr_title(payload, provider):
+    """Extract MR/PR title, provider-agnostic."""
+    if provider == "gitlab":
+        return (payload.get("merge_request") or {}).get("title", "")
+    if provider == "github":
+        return (payload.get("issue") or {}).get("title", "")
+    return ""
+
+
+def _extract_author_id(payload, provider):
+    """Extract comment author identifier, provider-agnostic.
+
+    GitLab: numeric user.id
+    GitHub: string sender.login
+    """
+    if provider == "gitlab":
+        return (payload.get("user") or {}).get("id")
+    if provider == "github":
+        return (payload.get("sender") or {}).get("login")
+    return None
 
 
 def is_note_on_merge_request(payload):
@@ -302,7 +591,7 @@ def build_slack_payload(mr_url, mr_title, author, severity, summary):
 # ---------------------------------------------------------------------------
 
 def post_to_slack(url, mr_url, mr_title, author, severity, summary,
-                  max_retries=3, retry_delay=1.0):
+                  max_retries=3, retry_delay=1.0, request_id=""):
     """POST formatted payload to Slack incoming webhook URL.
 
     Returns True on success, False if all retries exhausted or non-2xx.
@@ -363,34 +652,95 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
     return False
 
 
-def handle_webhook(payload, bot_user_id, slack_webhook_url):
-    """Dispatch a GitLab webhook payload. Returns True if handled (or
-    intentionally ignored, including disabled state). False only on hard errors."""
-    if not is_note_on_merge_request(payload):
-        log.debug("ignoring non-note event")
-        return True  # intentional ignore, not failure
+def handle_webhook(payload, bot_user_id, slack_webhook_url="",
+                  jira_url="", jira_email="", jira_token="",
+                  request_id="", admin_user_id="", headers=None):
+    """Dispatch a webhook payload from GitLab or GitHub. Returns True if handled
+    (or intentionally ignored). False only on hard errors.
+
+    Provider-agnostic via T30. Jira context (T22) extracted from MR/PR title.
+    Admin commands (T26) parsed from comment body if present.
+    """
+    provider = _detect_provider(payload, headers or {})
+    if not provider:
+        log.debug(f"ignoring unknown-provider payload rid={request_id}")
+        return True
+
+    # Extract provider-normalized fields
+    comment = _extract_comment(payload, provider)
+    pr_url = _extract_pr_url(payload, provider)
+    pr_title = _extract_mr_title(payload, provider)
+
+    # T26: admin commands — short-circuit before bot-comment check
+    if comment and comment.lstrip().startswith("/bot "):
+        # Ensure admin_user_id is up to date for this request
+        if admin_user_id:
+            _bot_state["admin_user_id"] = str(admin_user_id)
+        elif os.environ.get("BOT_ADMIN_USER_ID"):
+            _bot_state["admin_user_id"] = os.environ["BOT_ADMIN_USER_ID"]
+        return handle_admin_command(
+            comment, admin_user_id=_bot_state["admin_user_id"],
+            slack_webhook_url=slack_webhook_url,
+        )
+
+    # Regular flow: only act on bot's own comments
+    if provider == "gitlab" and not _is_gitlab_note_on_mr(payload):
+        log.debug(f"ignoring non-MR-note event rid={request_id}")
+        return True
 
     if not is_bot_comment(payload, bot_user_id):
-        log.debug("ignoring non-bot note")
+        log.debug(f"ignoring non-bot comment rid={request_id}")
         return True
 
-    # Bot note on MR, but Slack is disabled — intentional no-op, not failure.
+    # T26: respect disabled state — skip Slack but don't fail
+    if not _bot_state["enabled"]:
+        log.info(f"slack_skipped_disabled rid={request_id}")
+        metrics_inc("slack_posts_total", {"status": "disabled"})
+        return True
+
     if not slack_webhook_url:
-        log.info("slack_disabled skipping notification")
+        log.info(f"slack_disabled_config skipping notification rid={request_id}")
         return True
 
-    mr = payload.get("merge_request") or {}
-    note = (payload.get("object_attributes") or {}).get("note", "")
-    user = payload.get("user") or {}
+    # T22: fetch Jira context if applicable. Graceful — never raises.
+    jira_context = None
+    ticket_key = extract_jira_key(pr_title)
+    if not ticket_key and provider == "gitlab":
+        source_branch = (payload.get("merge_request") or {}).get("source_branch", "")
+        ticket_key = extract_jira_key(source_branch)
+    if ticket_key and jira_url and jira_email and jira_token:
+        log.info(f"jira_fetch_attempt key={ticket_key} rid={request_id}")
+        jira_context = fetch_jira_issue(
+            ticket_key,
+            jira_url=jira_url,
+            email=jira_email,
+            token=jira_token,
+        )
+        if jira_context:
+            log.info(f"jira_fetched key={ticket_key} rid={request_id}")
+
+    # Build summary with optional Jira context
+    bot_summary = _extract_summary(comment)
+    summary = bot_summary
+    if jira_context and jira_context.get("summary"):
+        summary = f"[{ticket_key}] {jira_context['summary']}\n\n{bot_summary}"
 
     return post_to_slack(
         url=slack_webhook_url,
-        mr_url=mr.get("url", ""),
-        mr_title=mr.get("title", "(no title)"),
-        author=user.get("username", "bot"),
-        severity=_extract_severity(note),
-        summary=_extract_summary(note),
+        mr_url=pr_url,
+        mr_title=pr_title,
+        author=str(_extract_author_id(payload, provider) or "bot"),
+        severity=_extract_severity(comment),
+        summary=summary,
+        request_id=request_id,
     )
+
+
+def _is_gitlab_note_on_mr(payload):
+    """True for GitLab note events on merge requests (not issues, not commits)."""
+    if payload.get("object_kind") != "note":
+        return False
+    return (payload.get("object_attributes") or {}).get("noteable_type") == "MergeRequest"
 
 
 def _extract_severity(note_text):
@@ -452,12 +802,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
             payload,
             bot_user_id=self.bot_user_id,
             slack_webhook_url=self.slack_webhook_url,
+            jira_url=os.environ.get("JIRA_URL", ""),
+            jira_email=os.environ.get("JIRA_EMAIL", ""),
+            jira_token=os.environ.get("JIRA_TOKEN", ""),
+            request_id=request_id,
+            admin_user_id=os.environ.get("BOT_ADMIN_USER_ID", ""),
+            headers=dict(self.headers),
         )
         metrics_inc("webhook_requests_total", {
             "path": self.path,
             "status": "200" if ok else "500",
         })
         self.send_response(200 if ok else 500)
+        self.send_header("X-Request-Id", request_id)
         self.end_headers()
 
     def do_GET(self):
