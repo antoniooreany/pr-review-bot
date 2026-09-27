@@ -45,7 +45,6 @@ class SecretResolutionTests(unittest.TestCase):
                 self.assertEqual(result, "default-value")
 
     def test_credman_failure_doesnt_crash(self):
-        """If PowerShell is missing or fails, we get None, not exception."""
         env = {k: v for k, v in os.environ.items() if k != "PR_TEST_KEY"}
         with patch.dict(os.environ, env, clear=True):
             with patch.object(notifier, "_read_windows_credman", side_effect=OSError("no powershell")):

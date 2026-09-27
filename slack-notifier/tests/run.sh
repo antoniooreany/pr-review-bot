@@ -19,4 +19,12 @@ def verify_signature(headers, expected_token):
 STUB
 fi
 
-PYTHONPATH=. python -m unittest tests.test_notifier tests.test_signature tests.test_healthcheck tests.test_v1_features tests.test_secrets -v 2>&1
+PYTHONPATH=. python -m unittest \
+    tests.test_notifier \
+    tests.test_signature \
+    tests.test_healthcheck \
+    tests.test_v1_features \
+    tests.test_secrets \
+    tests.test_admin_and_multi \
+    tests.test_coverage_v131 \
+    -v 2>&1
