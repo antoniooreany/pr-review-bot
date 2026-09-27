@@ -617,7 +617,7 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
             with urllib.request.urlopen(req, timeout=10) as resp:
                 code = resp.status
             if 200 <= code < 300:
-                log.info(f"slack_posted mr={mr_url} attempt={attempt}")
+                log.info(f"slack_posted mr={mr_url} rid={request_id} attempt={attempt}")
                 metrics_inc("slack_posts_total", {"status": "ok"})
                 return True
             # Non-2xx. If 5xx, retry. Otherwise, fatal.
