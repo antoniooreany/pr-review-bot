@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python (for TOML test)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run test suite
+        run: bash tests/run_all.sh
+
+      - name: Validate review guidelines structure
+        run: bash tests/test_review_guidelines.sh
+
+      - name: Validate GitLab CI template
+        run: bash tests/test_template_validity.sh
