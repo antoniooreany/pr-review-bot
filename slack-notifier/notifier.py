@@ -195,29 +195,103 @@ def _read_windows_credman(credman_target, key):
 
     Returns the password string, or None if not found / unsupported platform.
     Never raises — all errors map to None (graceful degradation).
+
+    Tries (in order):
+      1. CredentialManager snap-in (Windows PS 5.1) or module (PS Core)
+      2. P/Invoke into Advapi32 CredRead (works without modules)
+      3. None — caller falls back to env var or default
     """
     if sys.platform != "win32":
         return None
     target = f"{credman_target}:{key}"
-    ps_cmd = (
-        f"$ErrorActionPreference = 'SilentlyContinue'; "
-        f"$c = Get-StoredCredential -Target '{target}'; "
-        f"if ($c) {{ $c.GetNetworkCredential().Password }} "
-        f"else {{ '' }}"
+    # Attempt 1: try Get-StoredCredential with auto-loaded module
+    ps_cmd_with_module = (
+        "$ErrorActionPreference = 'SilentlyContinue'; "
+        "try { "
+        "  if ($PSVersionTable.PSVersion.Major -lt 6) { "
+        "    if (-not (Get-Command -Name Get-StoredCredential -ErrorAction SilentlyContinue)) { "
+        "      Add-PSSnapin Microsoft.PowerShell.CredentialManagement -ErrorAction SilentlyContinue "
+        "    } "
+        "  } else { "
+        "    Import-Module CredentialManager -ErrorAction SilentlyContinue "
+        "  } "
+        "  $c = Get-StoredCredential -Target '" + target + "' -ErrorAction SilentlyContinue; "
+        "  if ($c) { $c.GetNetworkCredential().Password } else { '' } "
+        "} catch { '' }"
     )
+    val = _run_powershell(ps_cmd_with_module)
+    if val:
+        return val
+    # Attempt 2: P/Invoke Advapi32 CredRead (no module needed)
+    ps_cmd_pinvoke = _PINVOKE_CREDREAD_SCRIPT.replace("__TARGET__", target)
+    val = _run_powershell(ps_cmd_pinvoke)
+    return val if val else None
+
+
+def _run_powershell(ps_cmd):
+    """Run a PowerShell snippet, return stripped stdout or None on any failure."""
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=10,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
-        log.debug(f"credman_read_failed target={target} err={e}")
+        log.debug(f"powershell_failed err={e}")
         return None
     if result.returncode != 0:
-        log.debug(f"credman_nonzero_exit target={target} stderr={result.stderr[:100]}")
+        log.debug(f"powershell_nonzero_exit stderr={result.stderr[:200]}")
         return None
     val = result.stdout.strip()
     return val if val else None
+
+
+# P/Invoke script: read credential from Windows Vault via Advapi32 CredRead.
+# Works without any third-party module — pure .NET P/Invoke.
+_PINVOKE_CREDREAD_SCRIPT = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+if (-not ([System.Management.Automation.PSTypeName]'Win.CredRead').Type) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public class Win {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct CREDENTIAL {
+        public uint Flags;
+        public uint Type;
+        public IntPtr TargetName;
+        public IntPtr Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public IntPtr TargetAlias;
+        public IntPtr UserName;
+    }
+    [DllImport("Advapi32.dll", EntryPoint="CredReadW", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern bool CredRead(string target, uint type, uint reservedFlag, out IntPtr credentialPtr);
+    [DllImport("Advapi32.dll", SetLastError=true)]
+    public static extern void CredFree([In] IntPtr cred);
+}
+"@ -ErrorAction SilentlyContinue
+}
+$ptr = [IntPtr]::Zero
+$ok = [Win]::CredRead('__TARGET__', 1, 0, [ref]$ptr)
+if ($ok -and $ptr -ne [IntPtr]::Zero) {
+    $cred = [System.Runtime.InteropServices.Marshal]::PtrToStructure($ptr, [type][Win+CREDENTIAL])
+    if ($cred.CredentialBlobSize -gt 0 -and $cred.CredentialBlob -ne [IntPtr]::Zero) {
+        $bytes = New-Object byte[] $cred.CredentialBlobSize
+        [System.Runtime.InteropServices.Marshal]::Copy($cred.CredentialBlob, $bytes, 0, $cred.CredentialBlobSize)
+        [Win]::CredFree($ptr)
+        [System.Text.Encoding]::Unicode.GetString($bytes)
+    } else {
+        [Win]::CredFree($ptr)
+        ''
+    }
+} else { '' }
+"""
 
 
 def _extract_comment(payload, provider):

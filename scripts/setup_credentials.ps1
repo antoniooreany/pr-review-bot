@@ -95,26 +95,58 @@ if ($listOutput -match [regex]::Escape($target)) {
 # ── Step 6: Test retrieval via PowerShell (same path as bot) ───────────
 
 Write-Step "Testing retrieval via PowerShell (same path the bot uses)..."
+# Ensure CredentialManager module is loaded (provides Get-StoredCredential).
+# Windows PowerShell 5.1 has it as a snap-in; PowerShell Core via PSGallery.
+$credModuleLoaded = $false
 try {
-    $stored = Get-StoredCredential -Target $target -ErrorAction Stop
-    if ($stored) {
-        $password = $stored.GetNetworkCredential().Password
-        if ($password.Length -gt 0) {
-            Write-Host "  OK: bot can retrieve key (length=$($password.Length))" -ForegroundColor Green
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        # Windows PowerShell — try snap-in first
+        if (-not (Get-Command -Name Get-StoredCredential -ErrorAction SilentlyContinue)) {
+            Add-PSSnapin Microsoft.PowerShell.CredentialManagement -ErrorAction Stop
+        }
+    } else {
+        # PowerShell Core — load if installed (don't auto-install, requires PSGallery access)
+        Import-Module CredentialManager -ErrorAction SilentlyContinue
+    }
+    $credModuleLoaded = $true
+} catch {
+    Write-Host "  WARN: CredentialManager module not available: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "        Install manually: Install-Module CredentialManager -Scope CurrentUser" -ForegroundColor Yellow
+    Write-Host "        Bot will fall back to cmdkey.exe /list for verification." -ForegroundColor Yellow
+}
+
+if ($credModuleLoaded) {
+    try {
+        $stored = Get-StoredCredential -Target $target -ErrorAction Stop
+        if ($stored) {
+            $password = $stored.GetNetworkCredential().Password
+            if ($password.Length -gt 0) {
+                Write-Host "  OK: bot can retrieve key (length=$($password.Length))" -ForegroundColor Green
+            } else {
+                Write-Host "  ERROR: retrieved empty password" -ForegroundColor Red
+                exit 1
+            }
+            $password = $null
+            [System.GC]::Collect()
         } else {
-            Write-Host "  ERROR: retrieved empty password" -ForegroundColor Red
+            Write-Host "  ERROR: Get-StoredCredential returned null" -ForegroundColor Red
             exit 1
         }
-        # Clear from memory
-        $password = $null
-        [System.GC]::Collect()
-    } else {
-        Write-Host "  ERROR: Get-StoredCredential returned null" -ForegroundColor Red
+    } catch {
+        Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
         exit 1
     }
-} catch {
-    Write-Host "  ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+} else {
+    # Fallback verification: just confirm cmdkey sees the credential
+    $listOutput = cmdkey /list | Out-String
+    if ($listOutput -match [regex]::Escape($target)) {
+        Write-Host "  PARTIAL: cmdkey sees credential, but bot cannot retrieve without CredentialManager module." -ForegroundColor Yellow
+        Write-Host "          Install CredentialManager module before running the bot:" -ForegroundColor Yellow
+        Write-Host "          Install-Module CredentialManager -Scope CurrentUser" -ForegroundColor Yellow
+    } else {
+        Write-Host "  ERROR: cmdkey /list does not show $target" -ForegroundColor Red
+        exit 1
+    }
 }
 
 # ── Done ─────────────────────────────────────────────────────────────
