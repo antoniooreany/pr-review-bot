@@ -177,6 +177,9 @@ def main():
     print("Note: this is STATIC analysis only (10 rules). Production bot also runs")
     print("LLM-based review via PR-Agent + MiniMax, catching semantic issues")
     print("(logic bugs, design patterns, security flaws) that regex can't see.")
+    print("")
+    print("IMPORTANT: the bot REVIEWS only. It does NOT auto-apply patches,")
+    print("auto-merge MRs, or push code. The author/reviewer owns the fix.")
     print("=" * 70)
 
 
