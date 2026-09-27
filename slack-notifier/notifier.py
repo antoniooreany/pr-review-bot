@@ -11,6 +11,7 @@ Design constraints:
 - Never blocks PR-Agent. If Slack is down, the sidecar logs and retries;
   PR-Agent continues unaffected.
 """
+import hmac
 import json
 import logging
 import os
@@ -32,6 +33,34 @@ log = logging.getLogger("slack-notifier")
 # ---------------------------------------------------------------------------
 # Pure functions — easy to unit-test, no I/O.
 # ---------------------------------------------------------------------------
+
+def verify_signature(headers, expected_token):
+    """Validate X-Gitlab-Token header against expected_token.
+
+    GitLab's webhook UI has a "Secret token" field that becomes the
+    `X-Gitlab-Token` header on every webhook delivery.
+
+    Returns True on match, False on mismatch.
+    Constant-time comparison via hmac.compare_digest (no timing oracle).
+    If expected_token is empty, validation is disabled (dev mode; caller
+    should log a warning).
+    """
+    if not expected_token:
+        return True
+
+    # HTTP headers are case-insensitive. rfile/HTTPServer normalizes them,
+    # but our function should be robust to either casing for direct callers.
+    provided = ""
+    for key, value in (headers or {}).items():
+        if key.lower() == "x-gitlab-token":
+            provided = value
+            break
+
+    if not provided:
+        return False
+
+    return hmac.compare_digest(provided, expected_token)
+
 
 def is_bot_comment(payload, bot_user_id):
     """True if the GitLab note event was authored by our bot user."""
@@ -185,12 +214,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
     # Configured at server start via env vars.
     bot_user_id = int(os.environ.get("GITLAB_BOT_USER_ID", "0"))
     slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
 
     def do_POST(self):
         if self.path != "/webhook":
             self.send_response(404)
             self.end_headers()
             return
+
+        # Defense in depth: validate signature even when nginx is in front.
+        if not verify_signature(self.headers, self.webhook_secret):
+            log.warning(f"webhook_signature_invalid path={self.path}")
+            self.send_response(401)
+            self.end_headers()
+            return
+
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length).decode("utf-8") if length else ""
         try:
@@ -227,6 +265,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("PORT", "3001"))
+    if not os.environ.get("WEBHOOK_SECRET"):
+        log.warning("WEBHOOK_SECRET not set — webhook signature validation disabled (dev mode)")
     server = HTTPServer(("0.0.0.0", port), WebhookHandler)
     log.info(f"starting slack-notifier on port {port}")
     try:
