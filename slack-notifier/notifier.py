@@ -302,7 +302,7 @@ def build_slack_payload(mr_url, mr_title, author, severity, summary):
 # ---------------------------------------------------------------------------
 
 def post_to_slack(url, mr_url, mr_title, author, severity, summary,
-                  max_retries=3, retry_delay=1.0):
+                  max_retries=3, retry_delay=1.0, request_id=""):
     """POST formatted payload to Slack incoming webhook URL.
 
     Returns True on success, False if all retries exhausted or non-2xx.
@@ -310,7 +310,7 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
     (bad payload / wrong URL — retrying won't help).
     """
     if not url:
-        log.info("slack_disabled (no SLACK_WEBHOOK_URL)")
+        log.info(f"slack_disabled rid={request_id}")
         metrics_inc("slack_posts_total", {"status": "disabled"})
         return False
 
@@ -328,32 +328,32 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
             with urllib.request.urlopen(req, timeout=10) as resp:
                 code = resp.status
             if 200 <= code < 300:
-                log.info(f"slack_posted mr={mr_url} attempt={attempt}")
+                log.info(f"slack_posted mr={mr_url} rid={request_id} attempt={attempt}")
                 metrics_inc("slack_posts_total", {"status": "ok"})
                 return True
             # Non-2xx. If 5xx, retry. Otherwise, fatal.
             if 500 <= code < 600:
-                log.warning(f"slack_5xx mr={mr_url} code={code} attempt={attempt}")
+                log.warning(f"slack_5xx mr={mr_url} code={code} attempt={attempt} rid={request_id}")
                 if attempt < max_retries:
                     time.sleep(retry_delay * attempt)  # linear backoff
                     continue
                 metrics_inc("slack_posts_total", {"status": "fail"})
                 return False
-            log.error(f"slack_4xx mr={mr_url} code={code} fatal")
+            log.error(f"slack_4xx mr={mr_url} code={code} fatal rid={request_id}")
             metrics_inc("slack_posts_total", {"status": "fail"})
             return False
         except urllib.error.HTTPError as e:
             # HTTPError carries a status code; treat like a response.
             code = e.code
             if 500 <= code < 600 and attempt < max_retries:
-                log.warning(f"slack_http_error mr={mr_url} code={code} attempt={attempt}")
+                log.warning(f"slack_http_error mr={mr_url} code={code} attempt={attempt} rid={request_id}")
                 time.sleep(retry_delay * attempt)
                 continue
-            log.error(f"slack_http_error_fatal mr={mr_url} code={code}")
+            log.error(f"slack_http_error_fatal mr={mr_url} code={code} rid={request_id}")
             metrics_inc("slack_posts_total", {"status": "fail"})
             return False
         except (urllib.error.URLError, TimeoutError) as e:
-            log.warning(f"slack_network_error mr={mr_url} err={e} attempt={attempt}")
+            log.warning(f"slack_network_error mr={mr_url} err={e} attempt={attempt} rid={request_id}")
             if attempt < max_retries:
                 time.sleep(retry_delay * attempt)
                 continue
@@ -363,33 +363,61 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
     return False
 
 
-def handle_webhook(payload, bot_user_id, slack_webhook_url):
+def handle_webhook(payload, bot_user_id, slack_webhook_url="",
+                  jira_url="", jira_email="", jira_token="",
+                  request_id=""):
     """Dispatch a GitLab webhook payload. Returns True if handled (or
-    intentionally ignored, including disabled state). False only on hard errors."""
-    if not is_note_on_merge_request(payload):
-        log.debug("ignoring non-note event")
-        return True  # intentional ignore, not failure
+    intentionally ignored, including disabled state). False only on hard errors.
 
-    if not is_bot_comment(payload, bot_user_id):
-        log.debug("ignoring non-bot note")
+    Jira context (T22): if MR title/branch has HD-NNN and jira_* are
+    configured, fetches the ticket and prepends summary to the Slack payload.
+    Graceful degradation: Jira failures don't break the notification.
+    """
+    if not is_note_on_merge_request(payload):
+        log.debug(f"ignoring non-note event rid={request_id}")
         return True
 
-    # Bot note on MR, but Slack is disabled — intentional no-op, not failure.
+    if not is_bot_comment(payload, bot_user_id):
+        log.debug(f"ignoring non-bot note rid={request_id}")
+        return True
+
     if not slack_webhook_url:
-        log.info("slack_disabled skipping notification")
+        log.info(f"slack_disabled skipping notification rid={request_id}")
         return True
 
     mr = payload.get("merge_request") or {}
     note = (payload.get("object_attributes") or {}).get("note", "")
     user = payload.get("user") or {}
 
+    # T22: fetch Jira context if applicable. Graceful — never raises.
+    jira_context = None
+    mr_title = mr.get("title", "(no title)")
+    ticket_key = extract_jira_key(mr_title) or extract_jira_key(mr.get("source_branch", ""))
+    if ticket_key and jira_url and jira_email and jira_token:
+        log.info(f"jira_fetch_attempt key={ticket_key} rid={request_id}")
+        jira_context = fetch_jira_issue(
+            ticket_key,
+            jira_url=jira_url,
+            email=jira_email,
+            token=jira_token,
+        )
+        if jira_context:
+            log.info(f"jira_fetched key={ticket_key} rid={request_id}")
+
+    # Build summary with optional Jira context
+    bot_summary = _extract_summary(note)
+    summary = bot_summary
+    if jira_context and jira_context.get("summary"):
+        summary = f"[{ticket_key}] {jira_context['summary']}\n\n{bot_summary}"
+
     return post_to_slack(
         url=slack_webhook_url,
         mr_url=mr.get("url", ""),
-        mr_title=mr.get("title", "(no title)"),
+        mr_title=mr_title,
         author=user.get("username", "bot"),
         severity=_extract_severity(note),
-        summary=_extract_summary(note),
+        summary=summary,
+        request_id=request_id,
     )
 
 
@@ -452,6 +480,10 @@ class WebhookHandler(BaseHTTPRequestHandler):
             payload,
             bot_user_id=self.bot_user_id,
             slack_webhook_url=self.slack_webhook_url,
+            jira_url=os.environ.get("JIRA_URL", ""),
+            jira_email=os.environ.get("JIRA_EMAIL", ""),
+            jira_token=os.environ.get("JIRA_TOKEN", ""),
+            request_id=request_id,
         )
         metrics_inc("webhook_requests_total", {
             "path": self.path,

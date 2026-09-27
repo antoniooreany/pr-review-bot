@@ -101,6 +101,101 @@ class JiraFetchTests(unittest.TestCase):
         self.assertIsNone(notifier.extract_jira_key(None))
 
 
+# ── T22 wire-in: Jira context flows into webhook handling ───────────────────
+
+class JiraWiredTests(unittest.TestCase):
+    """When MR has HD-NNN, Jira fetch is called and context flows through."""
+
+    def test_jira_summary_added_to_slack_payload(self):
+        from unittest.mock import patch
+        captured = {}
+
+        def fake_post(url, mr_url, mr_title, author, severity, summary, **kwargs):
+            captured["mr_title"] = mr_title
+            captured["summary"] = summary
+            captured["url"] = url
+            return True
+
+        # Pretend Jira returns a ticket
+        def fake_fetch(key, **kwargs):
+            return {"key": key, "summary": "Add login", "description": "OAuth flow"}
+
+        with patch.object(notifier, "post_to_slack", side_effect=fake_post), \
+             patch.object(notifier, "fetch_jira_issue", side_effect=fake_fetch):
+            payload = {
+                "object_kind": "note",
+                "object_attributes": {"noteable_type": "MergeRequest", "note": "🤖 review"},
+                "merge_request": {
+                    "url": "https://gitlab/x/-/merge_requests/42",
+                    "title": "HD-1234: Add login flow",
+                },
+                "user": {"id": 99, "username": "pr-review-bot"},
+            }
+            result = notifier.handle_webhook(
+                payload,
+                bot_user_id=99,
+                slack_webhook_url="https://slack.example/webhook",
+                jira_url="https://jira.example",
+                jira_email="bot@example",
+                jira_token="tok",
+            )
+            self.assertTrue(result)
+            # Summary should now include Jira ticket title
+            self.assertIn("HD-1234", captured["summary"])
+            self.assertIn("Add login", captured["summary"])
+
+    def test_no_jira_key_skips_fetch(self):
+        from unittest.mock import patch
+        captured = {}
+
+        def fake_post(*args, **kwargs):
+            captured["called"] = True
+            return True
+
+        def fake_fetch(*args, **kwargs):
+            captured["fetched"] = True
+            return None
+
+        with patch.object(notifier, "post_to_slack", side_effect=fake_post), \
+             patch.object(notifier, "fetch_jira_issue", side_effect=fake_fetch):
+            payload = {
+                "object_kind": "note",
+                "object_attributes": {"noteable_type": "MergeRequest", "note": "review"},
+                "merge_request": {
+                    "url": "https://gitlab/x/-/merge_requests/42",
+                    "title": "no-jira-key-here",
+                },
+                "user": {"id": 99, "username": "bot"},
+            }
+            notifier.handle_webhook(
+                payload,
+                bot_user_id=99,
+                slack_webhook_url="https://slack.example/webhook",
+            )
+            self.assertTrue(captured.get("called"))
+            self.assertFalse(captured.get("fetched", False))
+
+    def test_jira_fetch_failure_doesnt_break(self):
+        from unittest.mock import patch
+
+        def fake_post(*args, **kwargs):
+            return True
+
+        def fake_fetch(*args, **kwargs):
+            return None  # graceful failure
+
+        with patch.object(notifier, "post_to_slack", side_effect=fake_post), \
+             patch.object(notifier, "fetch_jira_issue", side_effect=fake_fetch):
+            payload = {
+                "object_kind": "note",
+                "object_attributes": {"noteable_type": "MergeRequest", "note": "x"},
+                "merge_request": {"url": "x", "title": "HD-9999: broken ticket"},
+                "user": {"id": 99, "username": "bot"},
+            }
+            result = notifier.handle_webhook(payload, bot_user_id=99)
+            self.assertTrue(result)  # graceful, not failure
+
+
 # ── T23 Severity ────────────────────────────────────────────────────────────
 
 class SeverityTests(unittest.TestCase):
@@ -140,6 +235,45 @@ class RequestIdTests(unittest.TestCase):
     def test_unique(self):
         ids = {notifier.generate_request_id() for _ in range(1000)}
         self.assertEqual(len(ids), 1000)
+
+
+class RequestIdCorrelationTests(unittest.TestCase):
+    """T24 fix: rid flows through webhook → handle_webhook → post_to_slack
+    so all log lines for one request can be correlated."""
+
+    def test_rid_appears_in_slack_log(self):
+        import urllib.request
+        from unittest.mock import patch, MagicMock
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.status = 200
+            mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+            mock_resp.__exit__ = MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_resp
+
+            with patch.object(notifier, "log") as mock_log:
+                rid = "abcdef012345"
+                payload = {
+                    "object_kind": "note",
+                    "object_attributes": {"noteable_type": "MergeRequest", "note": "🤖 review"},
+                    "merge_request": {"url": "https://gitlab/x", "title": "test"},
+                    "user": {"id": 1, "username": "bot"},
+                }
+                notifier.handle_webhook(
+                    payload,
+                    bot_user_id=1,
+                    slack_webhook_url="https://slack/x",
+                    request_id=rid,
+                )
+
+                # Find the slack_posted log call
+                slack_log_calls = [c for c in mock_log.info.call_args_list
+                                   if "slack_posted" in str(c)]
+                self.assertTrue(len(slack_log_calls) > 0,
+                                "Expected at least one slack_posted log call")
+                # rid should be in the log message
+                self.assertIn(rid, str(slack_log_calls[0]))
 
 
 # ── Test helpers ────────────────────────────────────────────────────────────
