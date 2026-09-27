@@ -14,7 +14,9 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary, max_retries=
     return False
 def handle_webhook(payload, bot_user_id, slack_webhook_url):
     return False
+def verify_signature(headers, expected_token):
+    return False
 STUB
 fi
 
-PYTHONPATH=. python -m unittest tests.test_notifier -v 2>&1
+PYTHONPATH=. python -m unittest tests.test_notifier tests.test_signature -v 2>&1
