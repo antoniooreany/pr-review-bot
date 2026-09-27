@@ -27,4 +27,5 @@ PYTHONPATH=. python -m unittest \
     tests.test_secrets \
     tests.test_admin_and_multi \
     tests.test_coverage_v131 \
+    tests.test_coverage_v132 \
     -v 2>&1
