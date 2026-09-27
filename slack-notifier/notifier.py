@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -43,6 +44,68 @@ log = logging.getLogger("slack-notifier")
 def generate_request_id():
     """Generate a 12-char hex request_id for log correlation."""
     return uuid.uuid4().hex[:12]
+
+
+# ── T29: secrets resolution (env -> Windows Credential Manager -> fallback) ─
+
+def get_secret(key, credman_target="pr-review-bot", fallback=None):
+    """Resolve a secret by checking env var first, then Windows Credential Manager.
+
+    Resolution order:
+      1. Environment variable `key` — wins if set (even to empty string).
+      2. Windows Credential Manager: Generic credential with target
+         `<credman_target>:<KEY>` — read via PowerShell.
+      3. `fallback` — used if both missing.
+
+    Windows-specific: on non-Windows hosts, step 2 silently returns None.
+
+    Operators store creds once with `cmdkey /generic:pr-review-bot:<KEY>`:
+      cmdkey /generic:pr-review-bot:OPENAI_KEY /user:apikey
+    The /user value is the password (your secret). Read back via PowerShell.
+    """
+    val = os.environ.get(key)
+    if val:
+        return val
+    try:
+        cred_val = _read_windows_credman(credman_target, key)
+    except (OSError, RuntimeError) as e:
+        log.debug(f"get_secret_credman_failed key={key} err={e}")
+        cred_val = None
+    if cred_val:
+        return cred_val
+    return fallback
+
+
+def _read_windows_credman(credman_target, key):
+    """Read a generic credential from Windows Credential Manager via PowerShell.
+
+    Returns the password string, or None if not found / unsupported platform.
+    Never raises — all errors map to None (graceful degradation).
+    """
+    if sys.platform != "win32":
+        return None
+    target = f"{credman_target}:{key}"
+    # PowerShell: read Generic credential. -ErrorAction SilentlyContinue
+    # means "not found" exits 0 with empty output.
+    ps_cmd = (
+        f"$ErrorActionPreference = 'SilentlyContinue'; "
+        f"$c = Get-StoredCredential -Target '{target}'; "
+        f"if ($c) {{ $c.GetNetworkCredential().Password }} "
+        f"else {{ '' }}"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        log.debug(f"credman_read_failed target={target} err={e}")
+        return None
+    if result.returncode != 0:
+        log.debug(f"credman_nonzero_exit target={target} stderr={result.stderr[:100]}")
+        return None
+    val = result.stdout.strip()
+    return val if val else None
 
 
 # ── T21: metrics counters (Prometheus exposition format, in-memory) ──────────
@@ -440,28 +503,29 @@ def _extract_summary(note_text):
 # ---------------------------------------------------------------------------
 
 class WebhookHandler(BaseHTTPRequestHandler):
-    # Configured at server start via env vars.
-    bot_user_id = int(os.environ.get("GITLAB_BOT_USER_ID", "0"))
-    slack_webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
-    webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+    # Configured at server start via env vars or Windows Credential Manager
+    # (T29). Each secret is resolved in priority: env > CredMan > "".
+    # Tests can override by setting the class attribute directly.
+    bot_user_id = int(get_secret("GITLAB_BOT_USER_ID", fallback="0") or "0")
+    slack_webhook_url = get_secret("SLACK_WEBHOOK_URL") or ""
+    webhook_secret = get_secret("WEBHOOK_SECRET") or ""
 
     def do_POST(self):
-        # T24: request_id for log correlation across this request.
         request_id = generate_request_id()
         self._request_id = request_id
-        self.send_header("X-Request-Id", request_id)
 
         if self.path != "/webhook":
             metrics_inc("webhook_requests_total", {"path": self.path, "status": "404"})
             self.send_response(404)
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             return
 
-        # Defense in depth: validate signature even when nginx is in front.
         if not verify_signature(self.headers, self.webhook_secret):
             log.warning(f"webhook_signature_invalid rid={request_id}")
             metrics_inc("webhook_requests_total", {"path": self.path, "status": "401"})
             self.send_response(401)
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             return
 
@@ -473,6 +537,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.warning(f"invalid_json rid={request_id}")
             metrics_inc("webhook_requests_total", {"path": self.path, "status": "400"})
             self.send_response(400)
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             return
 
@@ -490,22 +555,23 @@ class WebhookHandler(BaseHTTPRequestHandler):
             "status": "200" if ok else "500",
         })
         self.send_response(200 if ok else 500)
+        self.send_header("X-Request-Id", request_id)
         self.end_headers()
 
     def do_GET(self):
-        # T24: attach request_id for log correlation.
+        # T24: attach request_id for log correlation. Header is set via
+        # _respond() helper AFTER send_response (BaseHTTPRequestHandler
+        # requires status line before headers).
         request_id = generate_request_id()
         self._request_id = request_id
-        self.send_header("X-Request-Id", request_id)
 
-        # Simple health endpoint for the sidecar itself.
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
             return
-        # Deep health: probe upstream dependencies in parallel.
         if self.path == "/health/deep":
             gitlab_url = os.environ.get("GITLAB_URL", "")
             llm_url = os.environ.get("OPENAI_BASE_URL", "")
@@ -513,6 +579,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             if not gitlab_url or not llm_url:
                 self.send_response(503)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("X-Request-Id", request_id)
                 self.end_headers()
                 self.wfile.write(b'{"status":"unconfigured"}')
                 return
@@ -525,17 +592,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
             code = 200 if result["status"] == "healthy" else 503
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             self.wfile.write(json.dumps(result).encode("utf-8"))
             return
-        # T21: Prometheus metrics endpoint.
         if self.path == "/metrics":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             self.wfile.write(metrics_render().encode("utf-8"))
             return
         self.send_response(404)
+        self.send_header("X-Request-Id", request_id)
         self.end_headers()
 
     def log_message(self, format, *args):
