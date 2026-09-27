@@ -1,0 +1,14 @@
+# Build context exclusions for docker compose
+.git
+.gitignore
+.specify
+tests
+README.md
+*.md
+!configuration.toml
+!review_guidelines.md
+.env
+.env.example
+.dockerignore
+docker-compose.yml
+pr-agent-data
