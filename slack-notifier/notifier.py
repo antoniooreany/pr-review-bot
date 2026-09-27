@@ -15,10 +15,13 @@ import hmac
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -34,6 +37,125 @@ log = logging.getLogger("slack-notifier")
 # ---------------------------------------------------------------------------
 # Pure functions — easy to unit-test, no I/O.
 # ---------------------------------------------------------------------------
+
+# ── T24: request_id generation (12 hex chars) ────────────────────────────────
+
+def generate_request_id():
+    """Generate a 12-char hex request_id for log correlation."""
+    return uuid.uuid4().hex[:12]
+
+
+# ── T21: metrics counters (Prometheus exposition format, in-memory) ──────────
+
+_metrics_counters = {}
+_metrics_gauges = {}
+
+
+def reset_metrics():
+    """Reset all metrics. Used by tests; not called in production."""
+    global _metrics_counters, _metrics_gauges
+    _metrics_counters = {}
+    _metrics_gauges = {}
+
+
+def metrics_inc(name, labels=None):
+    """Increment a counter with optional labels."""
+    safe = _safe_labels(labels or {})
+    key = (name, _labels_key(safe))
+    _metrics_counters[key] = _metrics_counters.get(key, 0) + 1
+
+
+def metrics_set(name, value, labels=None):
+    """Set a gauge value."""
+    safe = _safe_labels(labels or {})
+    key = (name, _labels_key(safe))
+    _metrics_gauges[key] = value
+
+
+# Label names that must NEVER appear in metrics output (could leak secrets).
+_SECRET_LABEL_NAMES = frozenset({
+    "api_key", "apikey", "secret", "password", "token",
+    "authorization", "auth", "private_key", "pat",
+})
+
+
+def _safe_labels(labels):
+    """Drop any label whose name is in the secrets blocklist."""
+    return {k: v for k, v in labels.items() if k.lower() not in _SECRET_LABEL_NAMES}
+
+
+def _labels_key(labels):
+    """Sort labels for consistent key generation."""
+    return tuple(sorted(labels.items()))
+
+
+def _format_labels(labels_tuple):
+    if not labels_tuple:
+        return ""
+    parts = [f'{k}="{v}"' for k, v in labels_tuple]
+    return "{" + ",".join(parts) + "}"
+
+
+def metrics_render():
+    """Render all metrics in Prometheus exposition format."""
+    lines = []
+    seen_names = set()
+    for (name, labels), value in sorted(_metrics_counters.items()):
+        if name not in seen_names:
+            lines.append(f"# HELP pr_review_bot_{name} counter")
+            lines.append(f"# TYPE pr_review_bot_{name} counter")
+            seen_names.add(name)
+        lines.append(f"pr_review_bot_{name}{_format_labels(labels)} {value}")
+    for (name, labels), value in sorted(_metrics_gauges.items()):
+        if name not in seen_names:
+            lines.append(f"# HELP pr_review_bot_{name} gauge")
+            lines.append(f"# TYPE pr_review_bot_{name} gauge")
+            seen_names.add(name)
+        lines.append(f"pr_review_bot_{name}{_format_labels(labels)} {value}")
+    return "\n".join(lines) + "\n"
+
+
+# ── T22: Jira fetch ───────────────────────────────────────────────────────────
+
+def extract_jira_key(text):
+    """Extract HD-NNN Jira key from MR title or branch name. None if absent."""
+    if not text:
+        return None
+    m = re.search(r'\b(HD-\d+)\b', str(text))
+    return m.group(1) if m else None
+
+
+def fetch_jira_issue(ticket_key, jira_url, email, token, timeout=5):
+    """Fetch Jira issue by key. Returns dict with key/summary/description,
+    or None on any failure (404, network error, auth failure).
+
+    Graceful degradation: never raises. Caller decides what to do.
+    """
+    if not ticket_key or not jira_url:
+        return None
+    url = f"{jira_url.rstrip('/')}/rest/api/2/issue/{ticket_key}"
+    credentials = base64.b64encode(f"{email}:{token}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {credentials}",
+        "Accept": "application/json",
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, OSError) as e:
+        log.warning(f"jira_fetch_failed key={ticket_key} err={e}")
+        return None
+    fields = data.get("fields") or {}
+    return {
+        "key": data.get("key", ticket_key),
+        "summary": fields.get("summary", ""),
+        "description": fields.get("description", ""),
+        "status": (fields.get("status") or {}).get("name", ""),
+    }
+
+
+# ── T21 probe and T22 fetch helpers ──────────────────────────────────────────
 
 def _probe_url(url, method="GET", headers=None, timeout=5):
     """Single HTTP probe. Returns dict with status, http_code (optional),
@@ -189,6 +311,7 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
     """
     if not url:
         log.info("slack_disabled (no SLACK_WEBHOOK_URL)")
+        metrics_inc("slack_posts_total", {"status": "disabled"})
         return False
 
     payload = build_slack_payload(mr_url, mr_title, author, severity, summary)
@@ -206,6 +329,7 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
                 code = resp.status
             if 200 <= code < 300:
                 log.info(f"slack_posted mr={mr_url} attempt={attempt}")
+                metrics_inc("slack_posts_total", {"status": "ok"})
                 return True
             # Non-2xx. If 5xx, retry. Otherwise, fatal.
             if 500 <= code < 600:
@@ -213,8 +337,10 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
                 if attempt < max_retries:
                     time.sleep(retry_delay * attempt)  # linear backoff
                     continue
+                metrics_inc("slack_posts_total", {"status": "fail"})
                 return False
             log.error(f"slack_4xx mr={mr_url} code={code} fatal")
+            metrics_inc("slack_posts_total", {"status": "fail"})
             return False
         except urllib.error.HTTPError as e:
             # HTTPError carries a status code; treat like a response.
@@ -224,12 +350,14 @@ def post_to_slack(url, mr_url, mr_title, author, severity, summary,
                 time.sleep(retry_delay * attempt)
                 continue
             log.error(f"slack_http_error_fatal mr={mr_url} code={code}")
+            metrics_inc("slack_posts_total", {"status": "fail"})
             return False
         except (urllib.error.URLError, TimeoutError) as e:
             log.warning(f"slack_network_error mr={mr_url} err={e} attempt={attempt}")
             if attempt < max_retries:
                 time.sleep(retry_delay * attempt)
                 continue
+            metrics_inc("slack_posts_total", {"status": "fail"})
             return False
 
     return False
@@ -290,14 +418,21 @@ class WebhookHandler(BaseHTTPRequestHandler):
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
 
     def do_POST(self):
+        # T24: request_id for log correlation across this request.
+        request_id = generate_request_id()
+        self._request_id = request_id
+        self.send_header("X-Request-Id", request_id)
+
         if self.path != "/webhook":
+            metrics_inc("webhook_requests_total", {"path": self.path, "status": "404"})
             self.send_response(404)
             self.end_headers()
             return
 
         # Defense in depth: validate signature even when nginx is in front.
         if not verify_signature(self.headers, self.webhook_secret):
-            log.warning(f"webhook_signature_invalid path={self.path}")
+            log.warning(f"webhook_signature_invalid rid={request_id}")
+            metrics_inc("webhook_requests_total", {"path": self.path, "status": "401"})
             self.send_response(401)
             self.end_headers()
             return
@@ -307,7 +442,8 @@ class WebhookHandler(BaseHTTPRequestHandler):
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
-            log.warning(f"invalid_json path={self.path}")
+            log.warning(f"invalid_json rid={request_id}")
+            metrics_inc("webhook_requests_total", {"path": self.path, "status": "400"})
             self.send_response(400)
             self.end_headers()
             return
@@ -317,10 +453,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
             bot_user_id=self.bot_user_id,
             slack_webhook_url=self.slack_webhook_url,
         )
+        metrics_inc("webhook_requests_total", {
+            "path": self.path,
+            "status": "200" if ok else "500",
+        })
         self.send_response(200 if ok else 500)
         self.end_headers()
 
     def do_GET(self):
+        # T24: attach request_id for log correlation.
+        request_id = generate_request_id()
+        self._request_id = request_id
+        self.send_header("X-Request-Id", request_id)
+
         # Simple health endpoint for the sidecar itself.
         if self.path == "/health":
             self.send_response(200)
@@ -344,11 +489,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 llm_url=f"{llm_url.rstrip('/')}/v1/models",
                 llm_api_key=llm_key,
             )
+            metrics_set("last_health_check_timestamp_seconds", int(time.time()))
             code = 200 if result["status"] == "healthy" else 503
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode("utf-8"))
+            return
+        # T21: Prometheus metrics endpoint.
+        if self.path == "/metrics":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.end_headers()
+            self.wfile.write(metrics_render().encode("utf-8"))
             return
         self.send_response(404)
         self.end_headers()
