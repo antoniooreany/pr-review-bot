@@ -40,6 +40,15 @@ if "model_name" not in model_cfg:
     print(f"FAIL: [config.model] missing 'model_name' (got keys: {list(model_cfg.keys())})")
     sys.exit(1)
 
+# T28: MR scoping filters must be declared in [config] (even if empty lists).
+for key in ("ignore_pr_labels", "ignore_pr_authors", "ignore_title"):
+    if key not in config:
+        print(f"FAIL: [config] missing MR-scoping filter: '{key}'")
+        sys.exit(1)
+    if not isinstance(config[key], list):
+        print(f"FAIL: [config].{key} must be a list, got {type(config[key]).__name__}")
+        sys.exit(1)
+
 # Git provider config must exist as a sub-table (this project is GitLab-only).
 if "git_provider" not in config:
     print("FAIL: [config] missing 'git_provider' sub-table")
