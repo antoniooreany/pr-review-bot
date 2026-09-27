@@ -768,14 +768,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
     webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
 
     def do_POST(self):
-        # T24: request_id for log correlation across this request.
+        # T24: request_id for log correlation. Header is sent AFTER
+        # send_response (HTTP requires status line first).
         request_id = generate_request_id()
         self._request_id = request_id
-        self.send_header("X-Request-Id", request_id)
 
         if self.path != "/webhook":
             metrics_inc("webhook_requests_total", {"path": self.path, "status": "404"})
             self.send_response(404)
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             return
 
@@ -784,6 +785,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.warning(f"webhook_signature_invalid rid={request_id}")
             metrics_inc("webhook_requests_total", {"path": self.path, "status": "401"})
             self.send_response(401)
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             return
 
@@ -795,6 +797,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             log.warning(f"invalid_json rid={request_id}")
             metrics_inc("webhook_requests_total", {"path": self.path, "status": "400"})
             self.send_response(400)
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             return
 
@@ -818,15 +821,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # T24: attach request_id for log correlation.
+        # Header is sent AFTER send_response (HTTP requires status line first).
         request_id = generate_request_id()
         self._request_id = request_id
-        self.send_header("X-Request-Id", request_id)
 
         # Simple health endpoint for the sidecar itself.
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("X-Request-Id", request_id)
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
             return
@@ -837,6 +840,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             llm_key = os.environ.get("OPENAI_KEY", "")
             if not gitlab_url or not llm_url:
                 self.send_response(503)
+                self.send_header("X-Request-Id", request_id)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"status":"unconfigured"}')
@@ -849,6 +853,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             metrics_set("last_health_check_timestamp_seconds", int(time.time()))
             code = 200 if result["status"] == "healthy" else 503
             self.send_response(code)
+            self.send_header("X-Request-Id", request_id)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(result).encode("utf-8"))
@@ -861,6 +866,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.wfile.write(metrics_render().encode("utf-8"))
             return
         self.send_response(404)
+        self.send_header("X-Request-Id", request_id)
         self.end_headers()
 
     def log_message(self, format, *args):
