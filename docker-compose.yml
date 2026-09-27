@@ -3,7 +3,9 @@
 
 services:
   pr-agent:
-    image: pragent/pr-agent:latest
+    # Pinned to a specific version for reproducibility.
+    # Update procedure: see docs/pr-agent-version.md
+    image: pragent/pr-agent:0.46.0
     container_name: pr-review-bot
     restart: unless-stopped
 

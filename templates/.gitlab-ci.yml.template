@@ -1,0 +1,61 @@
+# Mode B — pr-review-bot GitLab CI integration template.
+#
+# This template is included by target GitLab repositories to enable the bot
+# as a per-MR CI job. It does NOT modify any CI/CD code in the including
+# repo beyond a single `include:` directive.
+#
+# Usage in a target repo (.gitlab-ci.yml of that repo):
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/pr-review-bot/pr-review-bot/v0.2.0-dual-mode/templates/.gitlab-ci.yml.template'
+#
+# Required CI/CD variables (set in target repo's Settings → CI/CD → Variables):
+#   - MINIMAX_API_KEY  (masked, protected): MiniMax LLM API key
+#   - PR_AGENT_TOKEN   (masked, protected): GitLab PAT with `api` scope,
+#                                          service account, owned by ops
+#
+# Pin to a specific tag of pr-review-bot, not `main`, to avoid surprise
+# changes from upstream.
+
+pr-review-bot:
+  stage: review
+  # Pinned image version — keep in sync with docker-compose.yml and
+  # docs/pr-agent-version.md.
+  image: pragent/pr-agent:0.46.0
+  rules:
+    # Only run on MR events. Saves tokens — no LLM calls on push-to-branch.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  variables:
+    # Spring Boot review focus, derived from Confluence sources. Keep this
+    # in sync with review_guidelines.md so behaviour matches between modes.
+    # Sources cited in docs/deployment-modes.md.
+    PR_REVIEWER_EXTRA_INSTRUCTIONS: |
+      You are reviewing a Spring Boot Java application at hotels-data.
+      Focus on:
+      1. SOLID/DRY/KISS principles
+      2. @Transactional correctness (no @Transactional on private methods)
+      3. JPA N+1 queries, missing fetch strategies
+      4. Constructor injection (not field @Autowired)
+      5. @ControllerAdvice / @ExceptionHandler for centralized handling
+      6. @Valid / @Validated on controller params, Bean Validation on DTOs
+      7. Security: SQL injection, XSS, missing @PreAuthorize, secrets in code
+      8. Log levels: ERROR for unexpected, WARN for recoverable, INFO for
+         business events, DEBUG for technical. No PII / secrets in logs.
+      9. Hardcoded values that should live in application.properties
+      10. Code smells: god classes, long methods (>30 lines), deep nesting
+      11. Tests: new behavior must come with unit tests
+      12. CHANGELOG.md updated in the same commit
+
+      You are an ASSISTANT, not a gatekeeper. Comment only — never block,
+      approve, or close MRs. Author owns the code.
+
+      Never include production data, customer PII, secrets, fraud logic,
+      or pricing algorithms in your analysis context.
+    # Inline comments + summary.
+    PR_REVIEWER_NUM_CODE_SUGGESTIONS: "5"
+    PR_REVIEWER_INLINE_CODE_COMMENTS: "true"
+  script:
+    - pr-agent review
+        --pr_url="$CI_MERGE_REQUEST_PROJECT_URL/-/merge_requests/$CI_MERGE_REQUEST_IID"
+  # Job-level controls — these come from the including repo's CI/CD variables,
+  # not from this template, so each repo controls its own secrets.
