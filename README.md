@@ -127,6 +127,24 @@ per `/review`):
 Switch model by editing `configuration.toml` `[config.model].model_name` and
 restarting the container (or editing the template's image for Mode B).
 
+## MR scoping
+
+By default, the bot reviews every MR. Scope via `configuration.toml`:
+
+```toml
+[config]
+# Skip MRs with these labels (set on the MR in GitLab UI)
+ignore_pr_labels = ["do-not-review", "wip", "draft"]
+
+# Skip MRs from these authors (usernames, case-sensitive)
+ignore_pr_authors = []  # e.g., ["renovate-bot", "dependabot"]
+
+# Skip MRs whose title matches any of these regex patterns
+ignore_title = []  # e.g., [".*\\[automated\\].*"]
+```
+
+Devs can opt-out per-MR by adding a `do-not-review` label.
+
 ## CI/CD
 
 This project's own CI runs on **GitHub Actions** (`.github/workflows/ci.yml`):

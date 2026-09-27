@@ -8,6 +8,19 @@ publish_output = true
 # Verbose logging helps while tuning; flip to false in steady state.
 verbosity_level = 1
 
+# ── MR scoping filters (T28) ────────────────────────────────────────────────
+# Skip MRs whose author added any of these labels (PR-Agent native).
+# Add your own labels here as opt-out grows in your team.
+ignore_pr_labels = ["do-not-review", "wip", "draft"]
+
+# Skip MRs from these authors (usernames, case-sensitive).
+# Useful for: bot accounts (renovate, dependabot) that generate noise.
+ignore_pr_authors = []
+
+# Skip MRs whose title matches any of these regex patterns.
+# Example: [".*\\[automated\\].*"] for auto-generated MRs.
+ignore_title = []
+
 [config.model]
 # MiniMax-M3 (OpenAI-compatible).
 model_name = "MiniMax-M3"
