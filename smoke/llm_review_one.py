@@ -10,6 +10,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 # otherwise the module-level `int(sys.argv[2])` breaks test discovery).
 REPO = ""
 PR_NUMBER = 0
+HEAD_SHA = ""  # cached after first fetch_head_sha() call
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "slack-notifier"))
 # Prefer env OPENAI_API_KEY (real OpenAI key in Anton's env), fall back to CredMan
@@ -142,6 +143,20 @@ def main():
     # Post to GitHub PR as a comment so it shows in the web UI.
     post_to_pr(content)
 
+    # T36: determine verdict and post GitHub Check Run + PR Review.
+    # This is what makes the bot block merges via branch protection.
+    try:
+        event, conclusion, summary = determine_verdict(content)
+        print(f"\n📊 Verdict: {event} (check conclusion: {conclusion})")
+        print(f"   {summary}")
+
+        global HEAD_SHA
+        HEAD_SHA = fetch_head_sha()
+        post_check_run(conclusion, summary)
+        post_review(event, f"🤖 **pr-review-bot verdict: {event}**\n\n{summary}\n\nSee PR comment for full review.")
+    except Exception as e:
+        print(f"   WARN: verdict posting failed: {e}")
+
 
 def post_to_pr(review_text):
     """Post review as a PR comment via gh CLI."""
@@ -161,6 +176,81 @@ def post_to_pr(review_text):
         print(f"   View at: https://github.com/antoniooreany/{REPO}/pull/{PR_NUMBER}")
     else:
         print(f"\n⚠️ Failed to post comment: {result.stderr}")
+
+
+def determine_verdict(text):
+    """Classify LLM review text and return (event, conclusion, summary).
+
+    Severity markers: '🔴 HIGH', '🟡 MEDIUM', '🟢 LOW'.
+
+    Returns:
+        event       — 'APPROVE' | 'COMMENT' | 'REQUEST_CHANGES' (GitHub PR review)
+        conclusion  — 'success' | 'neutral' | 'failure' (GitHub check run)
+        summary     — short description for the status check
+    """
+    high = text.count("🔴 HIGH")
+    medium = text.count("🟡 MEDIUM")
+    low = text.count("🟢 LOW")
+
+    if high > 0:
+        return ("REQUEST_CHANGES", "failure",
+                f"🔴 {high} HIGH issue(s) — merge blocked until fixed")
+    if medium > 0:
+        return ("COMMENT", "neutral",
+                f"🟡 {medium} MEDIUM issue(s) — review needed")
+    return ("APPROVE", "success",
+            f"✅ Only {low} LOW issue(s) — safe to merge")
+
+
+def fetch_head_sha():
+    """Get the head SHA of the current PR (for status check)."""
+    result = subprocess.run(
+        ["gh", "pr", "view", str(PR_NUMBER),
+         "--repo", f"antoniooreany/{REPO}",
+         "--json", "headRefOid"],
+        capture_output=True, text=True, check=True,
+    )
+    import json as _json
+    return _json.loads(result.stdout)["headRefOid"]
+
+
+def post_check_run(conclusion, summary):
+    """Post a status check on the PR's head SHA. Visible as a badge in PR UI
+    and can block merge via branch protection rule on this context name.
+
+    Uses GitHub Status API (legacy) — works with PAT, no GitHub App required.
+    conclusion: 'success' | 'neutral' | 'failure' (GitHub Status API state)
+    summary:     short description for the status badge
+    """
+    sha = HEAD_SHA or fetch_head_sha()
+    # Map verdict conclusion → Status API state (same names)
+    result = subprocess.run(
+        ["gh", "api", f"repos/antoniooreany/{REPO}/statuses/{sha}",
+         "-X", "POST",
+         "-f", f"state={conclusion}",
+         "-f", "context=pr-review-bot/pr-review",
+         "-f", f"description={summary}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"   ✅ Status: state={conclusion}")
+    else:
+        print(f"   ⚠️ Status failed: {result.stderr[:200]}")
+
+
+def post_review(event, body):
+    """Submit a PR review with given event (APPROVE/COMMENT/REQUEST_CHANGES)."""
+    result = subprocess.run(
+        ["gh", "api", f"repos/antoniooreany/{REPO}/pulls/{PR_NUMBER}/reviews",
+         "-X", "POST",
+         "-f", f"event={event}",
+         "-f", f"body={body}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"   ✅ PR review: {event}")
+    else:
+        print(f"   ⚠️ PR review failed: {result.stderr[:200]}")
 
 
 if __name__ == "__main__":

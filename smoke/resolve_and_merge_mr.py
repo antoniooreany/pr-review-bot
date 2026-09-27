@@ -1,13 +1,57 @@
-"""Resolve threads + merge MR !359 + check status of remaining MRs."""
-import sys, json, urllib.request, urllib.error
-sys.stdout.reconfigure(encoding='utf-8')
-sys.path.insert(0, 'slack-notifier')
-from notifier import get_secret
+"""Resolve threads + merge MRs via GitLab API.
 
-# Use Anton's GitLab PAT from CredMan
-TOKEN = get_secret('GITLAB_TOKEN', credman_target='git:https://gitlab.winwin.travel')
-HEADERS = {'PRIVATE-TOKEN': TOKEN, 'Content-Type': 'application/json'}
-BASE = 'https://gitlab.winwin.travel/api/v4/projects/198'
+Designed for `satdevpro` (Nikita Zuber) or any other maintainer of
+wwt-public/hotels-data/hotels-data (project 198) to run on their
+machine.
+
+Usage:
+  # If you have your GitLab token in CredMan under default target:
+  python smoke/resolve_and_merge_mr.py
+
+  # Or pass token directly via env:
+  GITLAB_TOKEN=glpat-xxxxxxxxxxxx python smoke/resolve_and_merge_mr.py
+
+Workflow per MR (!411, !359, !361, !362, !390):
+  1. Cancel auto-merge if set (POST .../cancel_merge_when_pipeline_succeeds)
+  2. Resolve all unresolved threads (PUT .../discussions/{id})
+  3. Try merge (PUT .../merge)
+  4. Report final status
+
+Already merged MRs are skipped.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+# Resolve token: env var → CredMan (try several targets)
+TOKEN = os.environ.get("GITLAB_TOKEN")
+if not TOKEN:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "slack-notifier"))
+    from notifier import get_secret
+    for target in ("GITLAB_TOKEN", "git:https://gitlab.winwin.travel",
+                   "pr-review-bot:GITLAB_MAINTAINER", "pr-review-bot:GITLAB"):
+        TOKEN = get_secret(target)
+        if TOKEN:
+            break
+    if not TOKEN:
+        print("ERROR: no GitLab token. Set $GITLAB_TOKEN or store in CredMan.")
+        sys.exit(1)
+
+HEADERS = {"PRIVATE-TOKEN": TOKEN, "Content-Type": "application/json"}
+BASE = "https://gitlab.winwin.travel/api/v4/projects/198"
+
+
+def api(method, path, body=None):
+    url = f"{BASE}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, headers=HEADERS, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
 
 
 def api(method, path, body=None):

@@ -56,6 +56,17 @@ else
 fi
 echo
 
+# LLM verdict + status check tests (TDD for T36)
+echo "── LLM verdict + check-run tests ──"
+if PYTHONPATH=. python -m unittest tests.test_llm_verdict -v 2>&1 > /dev/null; then
+    PASS=$((PASS + 1))
+    echo "PASS"
+else
+    FAIL=$((FAIL + 1))
+    FAILED_TESTS+=("tests/test_llm_verdict.py")
+fi
+echo
+
 echo "════════════════════════════════"
 echo "Passed: $PASS"
 echo "Failed: $FAIL"
