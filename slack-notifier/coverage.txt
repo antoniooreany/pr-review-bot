@@ -1,1 +1,5 @@
-No source for code: 'C:\Users\anton\Projects\pr-review-bot\smoke\e2e_smoke.py'; see https://coverage.readthedocs.io/en/7.14.1/messages.html#error-no-source
+Name                 Stmts   Miss  Cover
+----------------------------------------
+smoke\e2e_smoke.py     165      5    97%
+----------------------------------------
+TOTAL                  165      5    97%
