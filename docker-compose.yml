@@ -48,6 +48,38 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Sidecar: listens for GitLab note webhooks and posts to Slack when
+  # the bot user posts a comment. Decoupled from PR-Agent — if the
+  # sidecar is down, PR-Agent keeps reviewing.
+  slack-notifier:
+    image: python:3.12-slim
+    container_name: pr-review-bot-slack
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./slack-notifier:/app:ro
+    command: ["python", "notifier.py"]
+    environment:
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - GITLAB_BOT_USER_ID=${GITLAB_BOT_USER_ID:-0}
+      - PORT=3001
+    ports:
+      # Same loopback rule as PR-Agent — GitLab must POST here via reverse proxy.
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health', timeout=2)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      - pr-agent
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   pr-agent-data:
     name: pr-review-bot-data
